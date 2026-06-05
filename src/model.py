@@ -162,7 +162,7 @@ def build_model(config: dict | None = None) -> BindingTransformer:
         "n_layers":    6,
         "d_ffn":       3072,
         "dropout":     0.1,
-        "max_seq_len": 515,
+        "max_seq_len": 575,   # CLS(1) + DNA(60) + SEP(1) + Prot(512) + END(1)
     }
     if config is not None:
         default_config.update(config)

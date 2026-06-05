@@ -181,16 +181,16 @@ def parse_args():
     dna_p.add_argument("--fasta",      required=True)
     dna_p.add_argument("--output_dir", required=True)
     dna_p.add_argument("--batch_size", type=int, default=16)
-    dna_p.add_argument("--max_len",    type=int, default=256,
-                       help="Max tokens (after BPE). ~256 bp for DNABERT-2.")
+    dna_p.add_argument("--max_len",    type=int, default=60,
+                       help="Max tokens (after BPE). DNA sequences are 60bp.")
     dna_p.add_argument("--device",     default="cuda")
 
     prot_p = sub.add_parser("protein", help="Extract ESM-2 embeddings")
     prot_p.add_argument("--fasta",      required=True)
     prot_p.add_argument("--output_dir", required=True)
     prot_p.add_argument("--batch_size", type=int, default=16)
-    prot_p.add_argument("--max_len",    type=int, default=256,
-                        help="Max amino acids (truncated before tokenisation).")
+    prot_p.add_argument("--max_len",    type=int, default=512,
+                        help="Max amino acids. Protein sequences are 512aa.")
     prot_p.add_argument("--device",     default="cuda")
 
     return p.parse_args()

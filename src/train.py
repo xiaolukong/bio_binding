@@ -199,8 +199,8 @@ def parse_args():
     p.add_argument("--learnable_tau", action="store_true")
     p.add_argument("--warmup_frac",type=float, default=0.05)
     p.add_argument("--patience",   type=int,   default=10,   help="early stopping patience")
-    p.add_argument("--max_dna_len", type=int,  default=256)
-    p.add_argument("--max_prot_len",type=int,  default=256)
+    p.add_argument("--max_dna_len", type=int,  default=60)
+    p.add_argument("--max_prot_len",type=int,  default=512)
     p.add_argument("--num_workers", type=int,  default=4)
     p.add_argument("--resume",     default=None, help="path to checkpoint to resume from")
     # Model config overrides

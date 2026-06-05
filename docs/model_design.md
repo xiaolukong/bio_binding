@@ -35,10 +35,10 @@ Encoder 在训练过程中保持 frozen，仅作为特征提取器。后期如�
 
 （模型参数本身约 44M，fp16 仅占 0.08 GB，瓶颈在 O(L²) 的 attention activation。）
 
-**建议**：`max_dna_len = 256`，`max_prot_len = 256`，`max_seq_len = 515`
-- 覆盖约 256 bp DNA（足够大多数 TF binding site + 上下文）
-- 覆盖约 256 aa 蛋白质（足够大多数 DNA-binding domain）
-- 显存余量充足，不需要 gradient checkpointing
+**确认值**：`max_dna_len = 60`，`max_prot_len = 512`，`max_seq_len = 575`
+- DNA 序列固定长度 60 tokens（无需 padding/截断）
+- Protein 序列固定长度 512 aa（ESM-2 按氨基酸逐 token 编码）
+- 实测显存：activation 3.31 GB + 模型权重 0.08 GB + overhead 0.3 GB = **~3.7 GB**，8GB VRAM 余量充足，不需要 gradient checkpointing，也不需要将 d_model 降到 512
 
 ---
 
@@ -108,9 +108,9 @@ PosEmb:   0       1…L_dna   L_dna+1    L_dna+2…                    L_total-1
 | `n_layers` | **6** | v1 baseline，后续可扩展到 8-12 |
 | `d_ffn` | **3072** | 4 × d_model |
 | `dropout` | **0.1** | attention dropout 和 FFN dropout 统一 |
-| `max_dna_len` | **256** | DNA token 上限 |
-| `max_prot_len` | **256** | Protein token 上限 |
-| `max_seq_len` | **515** | CLS(1) + DNA(256) + SEP(1) + Prot(256) + END(1) |
+| `max_dna_len` | **60** | DNA token 上限（固定序列长度） |
+| `max_prot_len` | **512** | Protein token 上限（固定序列长度） |
+| `max_seq_len` | **575** | CLS(1) + DNA(60) + SEP(1) + Prot(512) + END(1) |
 | `activation` | **GELU** | FFN 激活 |
 | `norm` | **Pre-LN** | LayerNorm 置于 attention/FFN 之前，训练更稳定 |
 
@@ -123,7 +123,7 @@ PosEmb:   0       1…L_dna   L_dna+1    L_dna+2…                    L_total-1
 | `[END]` | B | 随机，可学习 |
 | Segment Emb A | — | 随机，可学习，shape (768,) |
 | Segment Emb B | — | 随机，可学习，shape (768,) |
-| Positional Emb | — | 随机，可学习，shape (515, 768) |
+| Positional Emb | — | 随机，可学习，shape (575, 768) |
 
 ### 5.4 Projection Head
 
@@ -235,7 +235,7 @@ Phase 2（可选 fine-tune）：
 - [x] 输出：连续 affinity scalar（回归方向，配合 ranking loss）
 - [x] Loss：Ranking InfoNCE，τ = 0.07（固定，后期可学习）
 - [x] Batch：4 data points × 8（1 pos + 7 neg）= 32 sequences
-- [x] 序列长度：DNA=256 tokens，Protein=256 tokens，总长 515
+- [x] 序列长度：DNA=60 tokens（固定），Protein=512 tokens（固定），总长 575
 - [x] Segment Embedding：使用，区分 DNA / Protein 模态
 - [x] 训练策略：Phase 1 frozen encoder，Phase 2 可选 fine-tune
 - [x] 硬件：GTX 5060（8GB），bf16 混合精度
