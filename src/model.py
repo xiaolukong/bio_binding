@@ -1,6 +1,77 @@
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+class FlashAttention(nn.Module):
+    """
+    Multi-head self-attention using F.scaled_dot_product_attention (Flash Attention).
+    Requires PyTorch >= 2.0. On supported hardware (Ampere+/Blackwell) this
+    dispatches to the fused Flash Attention kernel, which is ~2-3x faster and
+    uses O(L) memory instead of O(L^2) for the attention matrix.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads  = n_heads
+        self.d_head   = d_model // n_heads
+        self.dropout  = dropout
+
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+        B, L, d_model = x.shape
+
+        # Project to Q, K, V in one fused matmul
+        qkv = self.qkv_proj(x)                          # (B, L, 3*d_model)
+        q, k, v = qkv.chunk(3, dim=-1)                  # each (B, L, d_model)
+
+        # Reshape to (B, n_heads, L, d_head)
+        def split_heads(t):
+            return t.view(B, L, self.n_heads, self.d_head).transpose(1, 2)
+
+        q, k, v = split_heads(q), split_heads(k), split_heads(v)
+
+        # Convert padding mask to attention bias expected by SDPA
+        # key_padding_mask: (B, L), True = ignore -> attn_mask: (B, 1, 1, L) with -inf
+        attn_mask = None
+        if key_padding_mask is not None:
+            attn_mask = torch.zeros(B, 1, 1, L, dtype=q.dtype, device=x.device)
+            attn_mask = attn_mask.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf"))
+
+        # Flash Attention — O(L) memory, fused kernel on Ampere/Blackwell
+        dropout_p = self.dropout if self.training else 0.0
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
+
+        # Merge heads: (B, n_heads, L, d_head) -> (B, L, d_model)
+        out = out.transpose(1, 2).contiguous().view(B, L, d_model)
+        return self.out_proj(out)
+
+
+class TransformerEncoderLayer(nn.Module):
+    """Pre-LN Transformer encoder layer with Flash Attention."""
+
+    def __init__(self, d_model: int, n_heads: int, d_ffn: int, dropout: float):
+        super().__init__()
+        self.norm1    = nn.LayerNorm(d_model)
+        self.attn     = FlashAttention(d_model, n_heads, dropout)
+        self.norm2    = nn.LayerNorm(d_model)
+        self.ffn      = nn.Sequential(
+            nn.Linear(d_model, d_ffn),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ffn, d_model),
+        )
+        self.drop     = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+        # Pre-LN: norm before sublayer, residual after
+        x = x + self.drop(self.attn(self.norm1(x), key_padding_mask))
+        x = x + self.drop(self.ffn(self.norm2(x)))
+        return x
 
 
 class BindingTransformer(nn.Module):
@@ -21,14 +92,14 @@ class BindingTransformer(nn.Module):
         super().__init__()
         self.config = config
 
-        d_model   = config["d_model"]       # 768
-        d_dna     = config["d_dna"]         # 768  (DNABERT-2)
-        d_prot    = config["d_prot"]        # 320  (ESM-2 t6_8M)
-        n_heads   = config["n_heads"]       # 12
-        n_layers  = config["n_layers"]      # 6
-        d_ffn     = config["d_ffn"]         # 3072
-        dropout   = config["dropout"]       # 0.1
-        max_len   = config["max_seq_len"]   # 515
+        d_model  = config["d_model"]       # 768
+        d_dna    = config["d_dna"]         # 512  (DNABERT-2)
+        d_prot   = config["d_prot"]        # 960  (ESM-2 t6_8M)
+        n_heads  = config["n_heads"]       # 12
+        n_layers = config["n_layers"]      # 6
+        d_ffn    = config["d_ffn"]         # 3072
+        dropout  = config["dropout"]       # 0.1
+        max_len  = config["max_seq_len"]   # 575
 
         # --- Modality projections ---
         self.dna_proj  = nn.Linear(d_dna,  d_model)
@@ -39,27 +110,17 @@ class BindingTransformer(nn.Module):
         self.sep_token = nn.Parameter(torch.empty(1, 1, d_model))
         self.end_token = nn.Parameter(torch.empty(1, 1, d_model))
 
-        # --- Segment embeddings (A=DNA side, B=Protein side) ---
-        self.segment_emb = nn.Embedding(2, d_model)  # 0=A, 1=B
+        # --- Segment embeddings (0=DNA side, 1=Protein side) ---
+        self.segment_emb = nn.Embedding(2, d_model)
 
         # --- Positional embedding ---
         self.pos_emb = nn.Embedding(max_len, d_model)
 
-        # --- Transformer encoder (Pre-LN) ---
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=d_ffn,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,   # Pre-LN
-        )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=n_layers,
-            enable_nested_tensor=False,
-        )
+        # --- Transformer encoder (Pre-LN + Flash Attention) ---
+        self.layers = nn.ModuleList([
+            TransformerEncoderLayer(d_model, n_heads, d_ffn, dropout)
+            for _ in range(n_layers)
+        ])
 
         # --- CLS projection head ---
         self.head = nn.Sequential(
@@ -94,7 +155,7 @@ class BindingTransformer(nn.Module):
         dna_pad_mask: torch.Tensor | None = None,
         prot_pad_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        B = dna_emb.size(0)
+        B      = dna_emb.size(0)
         device = dna_emb.device
 
         # Project both modalities to d_model
@@ -110,59 +171,47 @@ class BindingTransformer(nn.Module):
         end = self.end_token.expand(B, -1, -1)
 
         # Concatenate: [CLS] | DNA | [SEP] | Prot | [END]
-        x = torch.cat([cls, dna_x, sep, prot_x, end], dim=1)
-        # x: (B, 1 + L_dna + 1 + L_prot + 1, d_model)
+        x       = torch.cat([cls, dna_x, sep, prot_x, end], dim=1)
         L_total = x.size(1)
 
-        # --- Segment embeddings ---
-        # Segment A: CLS(1) + DNA(L_dna) + SEP(1)
-        # Segment B: Prot(L_prot) + END(1)
+        # --- Segment embeddings (A=0: CLS+DNA+SEP, B=1: Prot+END) ---
         seg_ids = torch.cat([
             torch.zeros(1 + L_dna + 1, dtype=torch.long, device=device),
-            torch.ones(L_prot + 1,     dtype=torch.long, device=device),
-        ]).unsqueeze(0).expand(B, -1)  # (B, L_total)
+            torch.ones( L_prot + 1,    dtype=torch.long, device=device),
+        ]).unsqueeze(0).expand(B, -1)
         x = x + self.segment_emb(seg_ids)
 
         # --- Positional embeddings ---
         pos_ids = torch.arange(L_total, device=device).unsqueeze(0).expand(B, -1)
         x = x + self.pos_emb(pos_ids)
 
-        # --- Padding mask for transformer ---
-        # TransformerEncoder expects src_key_padding_mask: True = ignore
-        # Layout: [CLS(1)] [DNA(L_dna)] [SEP(1)] [Prot(L_prot)] [END(1)]
-        if dna_pad_mask is not None or prot_pad_mask is not None:
-            # Special tokens are never masked
-            no_mask = torch.zeros(B, 1, dtype=torch.bool, device=device)
-            if dna_pad_mask is None:
-                dna_pad_mask = torch.zeros(B, L_dna, dtype=torch.bool, device=device)
-            if prot_pad_mask is None:
-                prot_pad_mask = torch.zeros(B, L_prot, dtype=torch.bool, device=device)
-            # [CLS] | DNA | [SEP] | Prot | [END]
-            pad_mask = torch.cat(
-                [no_mask, dna_pad_mask, no_mask, prot_pad_mask, no_mask], dim=1
-            )
-        else:
-            pad_mask = None
+        # --- Build full padding mask: (B, L_total), True = ignore ---
+        no_mask = torch.zeros(B, 1, dtype=torch.bool, device=device)
+        if dna_pad_mask is None:
+            dna_pad_mask = torch.zeros(B, L_dna, dtype=torch.bool, device=device)
+        if prot_pad_mask is None:
+            prot_pad_mask = torch.zeros(B, L_prot, dtype=torch.bool, device=device)
+        pad_mask = torch.cat([no_mask, dna_pad_mask, no_mask, prot_pad_mask, no_mask], dim=1)
 
-        # --- Transformer ---
-        x = self.transformer(x, src_key_padding_mask=pad_mask)  # (B, L_total, d_model)
+        # --- Transformer layers ---
+        for layer in self.layers:
+            x = layer(x, key_padding_mask=pad_mask)
 
         # --- CLS head ---
-        h_cls = x[:, 0, :]          # (B, d_model)
-        score = self.head(h_cls)    # (B, 1)
-        return score.squeeze(-1)    # (B,)
+        h_cls = x[:, 0, :]
+        return self.head(h_cls).squeeze(-1)   # (B,)
 
 
 def build_model(config: dict | None = None) -> BindingTransformer:
     default_config = {
         "d_model":     768,
-        "d_dna":       768,
-        "d_prot":      320,
+        "d_dna":       512,
+        "d_prot":      960,
         "n_heads":     12,
         "n_layers":    6,
         "d_ffn":       3072,
         "dropout":     0.1,
-        "max_seq_len": 575,   # CLS(1) + DNA(60) + SEP(1) + Prot(512) + END(1)
+        "max_seq_len": 577,   # CLS(1) + DNA(60) + SEP(1) + Prot(514) + END(1)
     }
     if config is not None:
         default_config.update(config)

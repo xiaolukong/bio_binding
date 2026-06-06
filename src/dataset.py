@@ -1,171 +1,140 @@
 """
 Dataset utilities for DNA-Protein binding affinity training.
 
-Expected data directory layout:
+Data format
+-----------
+Each .npy file stores a dict with two keys:
+    'dna':  float32 array of shape (N, 8, 60,  512)
+    'prot': float32 array of shape (N, 8, 514, 960)
 
+    N   = number of data points in this file
+    8   = samples per data point (index 0 = positive, 1-7 = negatives)
+    60  = DNA token length
+    512 = DNA embedding dim (DNABERT-2 output)
+    514 = Protein token length
+    960 = Protein embedding dim (ESM-2 output)
+
+File layout
+-----------
     data/
-        pairs.csv          # columns: dna_id, protein_id, label (1=positive, 0=negative)
-        dna_embeddings/    # one .pt file per DNA sequence: {dna_id}.pt, shape (L, 768)
-        prot_embeddings/   # one .pt file per protein:      {protein_id}.pt, shape (L, 320)
+        samples_001.npy
+        samples_002.npy
+        ...
+        train_files.txt   # one filename per line, e.g. "samples_001.npy"
+        val_files.txt
 
-pairs.csv groups positives and negatives by data_point_id:
-    data_point_id, dna_id, protein_id, label
-    0, dna_001, prot_A, 1
-    0, dna_002, prot_A, 0
-    0, dna_003, prot_A, 0
-    ...
-    1, dna_011, prot_B, 1
-    ...
-
-Each data_point_id must have exactly 1 positive and N negatives (default N=7).
+Train/val split is done at the file level to prevent data leakage between
+data points that may share the same protein or experimental batch.
 """
 
 import os
+import numpy as np
 import torch
-import pandas as pd
 from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence
 
 
 class BindingDataset(Dataset):
     """
-    Returns one data point per __getitem__: a list of (dna_emb, prot_emb, label) tuples,
-    where the first entry is always the positive pair.
+    Loads one or more .npy sample files and exposes individual data points.
+
+    Each __getitem__ returns a dict with tensors of shape:
+        dna_emb:  (8, 60,  512)  -- all 8 samples for this data point
+        prot_emb: (8, 514, 960)
+        labels:   (8,)           -- 1 for positive (index 0), 0 for negatives
     """
 
-    def __init__(
-        self,
-        pairs_csv: str,
-        dna_emb_dir: str,
-        prot_emb_dir: str,
-        max_dna_len: int = 256,
-        max_prot_len: int = 256,
-        n_negatives: int = 7,
-    ):
-        self.dna_emb_dir  = dna_emb_dir
-        self.prot_emb_dir = prot_emb_dir
-        self.max_dna_len  = max_dna_len
-        self.max_prot_len = max_prot_len
-        self.n_negatives  = n_negatives
+    def __init__(self, file_paths: list[str]):
+        """
+        Args:
+            file_paths: list of absolute paths to .npy sample files.
+        """
+        dna_chunks  = []
+        prot_chunks = []
 
-        df = pd.read_csv(pairs_csv)
-        self._validate_columns(df)
+        for path in file_paths:
+            data = np.load(path, allow_pickle=True).item()
+            dna_chunks.append(data["dna"])    # (N, 8, 60,  512)
+            prot_chunks.append(data["prot"])  # (N, 8, 514, 960)
 
-        # Group by data_point_id; each group = 1 positive + N negatives
-        self.groups = []
-        for _, group in df.groupby("data_point_id", sort=True):
-            pos = group[group["label"] == 1]
-            neg = group[group["label"] == 0]
-            assert len(pos) == 1, f"data_point_id {group['data_point_id'].iloc[0]}: expected 1 positive, got {len(pos)}"
-            assert len(neg) >= n_negatives, (
-                f"data_point_id {group['data_point_id'].iloc[0]}: "
-                f"need {n_negatives} negatives, got {len(neg)}"
-            )
-            neg = neg.head(n_negatives)
-            self.groups.append(pd.concat([pos, neg]).reset_index(drop=True))
+        dna_all  = np.concatenate(dna_chunks,  axis=0)  # (total_N, 8, 60,  512)
+        prot_all = np.concatenate(prot_chunks, axis=0)  # (total_N, 8, 514, 960)
 
-    @staticmethod
-    def _validate_columns(df: pd.DataFrame):
-        required = {"data_point_id", "dna_id", "protein_id", "label"}
-        missing = required - set(df.columns)
-        if missing:
-            raise ValueError(f"pairs.csv missing columns: {missing}")
+        # Store as float32 tensors; labels are fixed: index 0 = positive
+        self.dna  = torch.from_numpy(dna_all)   # (total_N, 8, 60,  512)
+        self.prot = torch.from_numpy(prot_all)  # (total_N, 8, 514, 960)
 
-    def _load_emb(self, directory: str, seq_id: str, max_len: int) -> tuple[torch.Tensor, torch.Tensor]:
-        path = os.path.join(directory, f"{seq_id}.pt")
-        emb = torch.load(path, map_location="cpu")  # (L, D)
-        if emb.dim() == 3:
-            emb = emb.squeeze(0)
-        # Truncate if needed
-        if emb.size(0) > max_len:
-            emb = emb[:max_len]
-        pad_mask = torch.zeros(emb.size(0), dtype=torch.bool)  # all valid, no padding here
-        return emb, pad_mask
+        n_samples  = self.dna.size(1)
+        self.labels = torch.zeros(n_samples, dtype=torch.float32)
+        self.labels[0] = 1.0  # index 0 is always the positive
 
     def __len__(self) -> int:
-        return len(self.groups)
+        return self.dna.size(0)
 
-    def __getitem__(self, idx: int) -> list[dict]:
-        group = self.groups[idx]
-        samples = []
-        for _, row in group.iterrows():
-            dna_emb,  dna_mask  = self._load_emb(self.dna_emb_dir,  str(row["dna_id"]),     self.max_dna_len)
-            prot_emb, prot_mask = self._load_emb(self.prot_emb_dir, str(row["protein_id"]), self.max_prot_len)
-            samples.append({
-                "dna_emb":       dna_emb,
-                "prot_emb":      prot_emb,
-                "dna_pad_mask":  dna_mask,
-                "prot_pad_mask": prot_mask,
-                "label":         int(row["label"]),
-            })
-        return samples  # list of n_positives + n_negatives dicts
+    def __getitem__(self, idx: int) -> dict:
+        return {
+            "dna_emb":  self.dna[idx],    # (8, 60,  512)
+            "prot_emb": self.prot[idx],   # (8, 514, 960)
+            "labels":   self.labels,      # (8,)  shared across all data points
+        }
 
 
-def collate_fn(batch: list[list[dict]]) -> dict[str, torch.Tensor]:
+def collate_fn(batch: list[dict]) -> dict[str, torch.Tensor]:
     """
-    batch: list of data points, each a list of (1 pos + N neg) sample dicts.
-    Returns flat tensors with shape (B * (1+N), ...) where B = len(batch).
-    DNA and Protein sequences within the batch are padded to the longest in the batch.
+    Collates a list of data point dicts into flat batch tensors.
+
+    Input:  list of B dicts, each with tensors (8, L, D)
+    Output: flat tensors of shape (B*8, L, D) ready for the model
     """
-    flat_samples = [s for dp in batch for s in dp]
+    B          = len(batch)
+    group_size = batch[0]["dna_emb"].size(0)   # 8
 
-    dna_embs   = [s["dna_emb"]  for s in flat_samples]
-    prot_embs  = [s["prot_emb"] for s in flat_samples]
-    labels     = torch.tensor([s["label"] for s in flat_samples], dtype=torch.float)
-
-    # Pad sequences to max length in batch; pad_sequence pads at the end
-    dna_padded  = pad_sequence(dna_embs,  batch_first=True, padding_value=0.0)
-    prot_padded = pad_sequence(prot_embs, batch_first=True, padding_value=0.0)
-
-    # Build padding masks: True = padded position (should be ignored)
-    def make_pad_mask(seqs: list[torch.Tensor], padded: torch.Tensor) -> torch.Tensor:
-        mask = torch.ones(padded.size(0), padded.size(1), dtype=torch.bool)
-        for i, s in enumerate(seqs):
-            mask[i, : s.size(0)] = False  # valid positions
-        return mask
-
-    dna_pad_mask  = make_pad_mask(dna_embs,  dna_padded)
-    prot_pad_mask = make_pad_mask(prot_embs, prot_padded)
+    dna_emb  = torch.stack([s["dna_emb"]  for s in batch], dim=0)  # (B, 8, 60,  512)
+    prot_emb = torch.stack([s["prot_emb"] for s in batch], dim=0)  # (B, 8, 514, 960)
+    labels   = torch.stack([s["labels"]   for s in batch], dim=0)  # (B, 8)
 
     return {
-        "dna_emb":       dna_padded,    # (B*(1+N), L_dna,  768)
-        "prot_emb":      prot_padded,   # (B*(1+N), L_prot, 320)
-        "dna_pad_mask":  dna_pad_mask,  # (B*(1+N), L_dna)
-        "prot_pad_mask": prot_pad_mask, # (B*(1+N), L_prot)
-        "labels":        labels,        # (B*(1+N),)
+        "dna_emb":  dna_emb.view(B * group_size, *dna_emb.shape[2:]),    # (B*8, 60,  512)
+        "prot_emb": prot_emb.view(B * group_size, *prot_emb.shape[2:]),  # (B*8, 514, 960)
+        "labels":   labels.view(B * group_size),                          # (B*8,)
     }
+
+
+def _resolve_file_list(data_dir: str, list_file: str) -> list[str]:
+    """Reads a text file of filenames and returns absolute paths."""
+    with open(list_file) as f:
+        names = [line.strip() for line in f if line.strip()]
+    return [os.path.join(data_dir, name) for name in names]
 
 
 def build_dataloaders(
     data_dir: str,
-    train_csv: str,
-    val_csv: str,
-    batch_size: int = 4,      # number of data points per batch
-    n_negatives: int = 7,
-    max_dna_len: int = 256,
-    max_prot_len: int = 256,
+    train_list: str,
+    val_list: str,
+    batch_size: int = 10,
     num_workers: int = 4,
+    pin_memory: bool = True,
 ) -> tuple[DataLoader, DataLoader]:
-    dna_emb_dir  = os.path.join(data_dir, "dna_embeddings")
-    prot_emb_dir = os.path.join(data_dir, "prot_embeddings")
+    """
+    Args:
+        data_dir:   directory containing .npy files
+        train_list: path to text file listing training .npy filenames
+        val_list:   path to text file listing validation .npy filenames
+        batch_size: number of data points per batch
+        num_workers: DataLoader worker count
+    """
+    train_files = _resolve_file_list(data_dir, train_list)
+    val_files   = _resolve_file_list(data_dir, val_list)
 
-    common = dict(
-        dna_emb_dir=dna_emb_dir,
-        prot_emb_dir=prot_emb_dir,
-        max_dna_len=max_dna_len,
-        max_prot_len=max_prot_len,
-        n_negatives=n_negatives,
-    )
-    train_ds = BindingDataset(train_csv, **common)
-    val_ds   = BindingDataset(val_csv,   **common)
+    train_ds = BindingDataset(train_files)
+    val_ds   = BindingDataset(val_files)
 
-    loader_common = dict(
+    loader_kwargs = dict(
         batch_size=batch_size,
         collate_fn=collate_fn,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
     )
-    train_loader = DataLoader(train_ds, shuffle=True,  **loader_common)
-    val_loader   = DataLoader(val_ds,   shuffle=False, **loader_common)
+    train_loader = DataLoader(train_ds, shuffle=True,  **loader_kwargs)
+    val_loader   = DataLoader(val_ds,   shuffle=False, **loader_kwargs)
 
     return train_loader, val_loader

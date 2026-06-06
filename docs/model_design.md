@@ -12,8 +12,8 @@
 
 | 模态 | 模型 | Output Dim | 说明 |
 |------|------|-----------|------|
-| DNA | DNABERT-2 | **768** | HuggingFace 开源，BPE tokenizer |
-| Protein | ESM-2 (`esm2_t6_8M_UR50D`) | **320** | Meta 开源，每个氨基酸一个 token，6层/8M参数的轻量版本 |
+| DNA | DNABERT-2 | **512** | HuggingFace 开源，BPE tokenizer |
+| Protein | ESM-2 (`esm2_t6_8M_UR50D`) | **960** | Meta 开源，每个氨基酸一个 token，6层/8M参数的轻量版本 |
 
 Encoder 在训练过程中保持 frozen，仅作为特征提取器。后期如需 fine-tune，可解冻并使用更低的学习率（见第 6 节）。
 
@@ -35,7 +35,7 @@ Encoder 在训练过程中保持 frozen，仅作为特征提取器。后期如�
 
 （模型参数本身约 44M，fp16 仅占 0.08 GB，瓶颈在 O(L²) 的 attention activation。）
 
-**确认值**：`max_dna_len = 60`，`max_prot_len = 512`，`max_seq_len = 575`
+**确认值**：`max_dna_len = 60`，`max_prot_len = 514`，`max_seq_len = 577`
 - DNA 序列固定长度 60 tokens（无需 padding/截断）
 - Protein 序列固定长度 512 aa（ESM-2 按氨基酸逐 token 编码）
 - 实测显存：activation 3.31 GB + 模型权重 0.08 GB + overhead 0.3 GB = **~3.7 GB**，8GB VRAM 余量充足，不需要 gradient checkpointing，也不需要将 d_model 降到 512
@@ -51,7 +51,7 @@ DNA sequence  ──[frozen DNABERT-2]──► DNA embedding    (L_dna  × 768)
 Prot sequence ──[frozen ESM-2 t6]──► Prot embedding   (L_prot × 320)
                                               │
                         ┌─────────────────────┴─────────────────────┐
-               Linear(768 → 768)                          Linear(320 → 768)
+               Linear(512 → 768)                          Linear(960 → 768)
                + Segment Emb A                            + Segment Emb B
                         └─────────────────────┬─────────────────────┘
                                               │
@@ -96,8 +96,8 @@ PosEmb:   0       1…L_dna   L_dna+1    L_dna+2…                    L_total-1
 
 | 参数 | 值 |
 |------|----|
-| `d_dna` | 768（DNABERT-2） |
-| `d_protein` | 320（ESM-2 t6_8M） |
+| `d_dna` | 512（DNABERT-2） |
+| `d_protein` | 960（ESM-2 t6_8M） |
 
 ### 5.2 模型核心参数
 
@@ -109,8 +109,8 @@ PosEmb:   0       1…L_dna   L_dna+1    L_dna+2…                    L_total-1
 | `d_ffn` | **3072** | 4 × d_model |
 | `dropout` | **0.1** | attention dropout 和 FFN dropout 统一 |
 | `max_dna_len` | **60** | DNA token 上限（固定序列长度） |
-| `max_prot_len` | **512** | Protein token 上限（固定序列长度） |
-| `max_seq_len` | **575** | CLS(1) + DNA(60) + SEP(1) + Prot(512) + END(1) |
+| `max_prot_len` | **514** | Protein token 上限（固定序列长度） |
+| `max_seq_len` | **577** | CLS(1) + DNA(60) + SEP(1) + Prot(514) + END(1) |
 | `activation` | **GELU** | FFN 激活 |
 | `norm` | **Pre-LN** | LayerNorm 置于 attention/FFN 之前，训练更稳定 |
 
@@ -123,7 +123,7 @@ PosEmb:   0       1…L_dna   L_dna+1    L_dna+2…                    L_total-1
 | `[END]` | B | 随机，可学习 |
 | Segment Emb A | — | 随机，可学习，shape (768,) |
 | Segment Emb B | — | 随机，可学习，shape (768,) |
-| Positional Emb | — | 随机，可学习，shape (575, 768) |
+| Positional Emb | — | 随机，可学习，shape (577, 768) |
 
 ### 5.4 Projection Head
 
@@ -171,7 +171,7 @@ $$\mathcal{L} = \frac{1}{4} \sum_{i=1}^{4} \mathcal{L}_i$$
 | Warmup steps | `max(500, 0.05 × total_steps)` |
 | Gradient clipping | **1.0**（max norm） |
 | Mixed precision | **bf16**（GTX 5060 Blackwell 支持，比 fp16 更稳定） |
-| Batch size | 32（4 data points × 8） |
+| Batch size | **10 data points × 8 sequences = 80 sequences**（GPU 12GB，实测占用约 8.7 GB） |
 
 ### 6.4 评估指标
 
@@ -215,8 +215,8 @@ Phase 2（可选 fine-tune）：
 
 | 模块 | 参数量 |
 |------|--------|
-| DNA Projection（768→768） | 0.59M |
-| Protein Projection（320→768） | 0.25M |
+| DNA Projection（512→768） | 0.39M |
+| Protein Projection（960→768） | 0.74M |
 | Segment Embeddings（2×768） | 0.001M |
 | Positional Embedding（515×768） | 0.40M |
 | Transformer（6层，d=768，ffn=3072） | 42.5M |
@@ -230,12 +230,12 @@ Phase 2（可选 fine-tune）：
 
 ## 9. 已确认事项
 
-- [x] DNA Encoder：DNABERT-2，`d_dna = 768`
-- [x] Protein Encoder：ESM-2 t6_8M，`d_protein = 320`
+- [x] DNA Encoder：DNABERT-2，`d_dna = 512`
+- [x] Protein Encoder：ESM-2 t6_8M，`d_protein = 960`
 - [x] 输出：连续 affinity scalar（回归方向，配合 ranking loss）
 - [x] Loss：Ranking InfoNCE，τ = 0.07（固定，后期可学习）
 - [x] Batch：4 data points × 8（1 pos + 7 neg）= 32 sequences
-- [x] 序列长度：DNA=60 tokens（固定），Protein=512 tokens（固定），总长 575
+- [x] 序列长度：DNA=60 tokens（固定），Protein=514 tokens（固定），总长 577
 - [x] Segment Embedding：使用，区分 DNA / Protein 模态
 - [x] 训练策略：Phase 1 frozen encoder，Phase 2 可选 fine-tune
 - [x] 硬件：GTX 5060（8GB），bf16 混合精度

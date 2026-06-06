@@ -2,12 +2,19 @@
 Training script for BindingTransformer.
 
 Usage:
-    python src/train.py --data_dir data/ --train_csv data/train.csv --val_csv data/val.csv
+    python src/train.py \
+        --data_dir data/ \
+        --train_list data/train_files.txt \
+        --val_list   data/val_files.txt
+
+train_files.txt / val_files.txt: one .npy filename per line, e.g.:
+    samples_001.npy
+    samples_002.npy
 
 Key design decisions:
-- Loss: ranking InfoNCE over (1 pos + N neg) per data point
-- Each data point contributes one softmax over its group of scores
-- Temperature tau is fixed at 0.07 (can be made learnable via --learnable_tau)
+- Loss: ranking InfoNCE over (1 pos + 7 neg) per data point
+- Train/val split is file-level to prevent data leakage
+- Temperature tau is fixed at 0.07 (enable --learnable_tau to make it trainable)
 """
 
 import argparse
@@ -42,7 +49,6 @@ class RankingInfoNCE(nn.Module):
         super().__init__()
         self.group_size = group_size
         if learnable:
-            # Parameterise in log space to keep tau > 0
             self.log_tau = nn.Parameter(torch.tensor(math.log(tau)))
         else:
             self.register_buffer("log_tau", torch.tensor(math.log(tau)))
@@ -52,12 +58,9 @@ class RankingInfoNCE(nn.Module):
         return self.log_tau.exp()
 
     def forward(self, scores: torch.Tensor) -> torch.Tensor:
-        # scores: (B * group_size,)
         n_groups = scores.size(0) // self.group_size
-        scores = scores.view(n_groups, self.group_size)      # (n_groups, group_size)
-        logits = scores / self.tau                           # scale by temperature
-        # Positive is always index 0 in each group
-        labels = torch.zeros(n_groups, dtype=torch.long, device=scores.device)
+        logits   = scores.view(n_groups, self.group_size) / self.tau
+        labels   = torch.zeros(n_groups, dtype=torch.long, device=scores.device)
         return F.cross_entropy(logits, labels)
 
 
@@ -66,24 +69,17 @@ class RankingInfoNCE(nn.Module):
 # ---------------------------------------------------------------------------
 
 def compute_metrics(scores: np.ndarray, labels: np.ndarray, group_size: int) -> dict:
-    """
-    scores, labels: flat arrays of length (n_groups * group_size).
-    Returns AUROC, AUPRC-proxy, and Top-1 accuracy.
-    """
     n_groups = len(scores) // group_size
-    scores_g  = scores.reshape(n_groups, group_size)
-    labels_g  = labels.reshape(n_groups, group_size)
+    scores_g = scores.reshape(n_groups, group_size)
 
-    # Top-1 accuracy: positive (idx 0) is the highest-scored in the group
-    top1 = (scores_g.argmax(axis=1) == 0).mean()
+    top1 = float((scores_g.argmax(axis=1) == 0).mean())
 
-    # AUROC over all (positive, negative) pairs pooled
     try:
-        auroc = roc_auc_score(labels, scores)
+        auroc = float(roc_auc_score(labels, scores))
     except ValueError:
         auroc = float("nan")
 
-    return {"auroc": float(auroc), "top1_acc": float(top1)}
+    return {"auroc": auroc, "top1_acc": top1}
 
 
 # ---------------------------------------------------------------------------
@@ -92,16 +88,15 @@ def compute_metrics(scores: np.ndarray, labels: np.ndarray, group_size: int) -> 
 
 def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device, group_size):
     model.train()
+    amp_dtype = get_autocast_dtype(device)
     total_loss = 0.0
     for batch in loader:
-        dna_emb      = batch["dna_emb"].to(device)
-        prot_emb     = batch["prot_emb"].to(device)
-        dna_mask     = batch["dna_pad_mask"].to(device)
-        prot_mask    = batch["prot_pad_mask"].to(device)
+        dna_emb  = batch["dna_emb"].to(device)
+        prot_emb = batch["prot_emb"].to(device)
 
         optimizer.zero_grad()
-        with autocast(device_type=device.type, dtype=torch.bfloat16):
-            scores = model(dna_emb, prot_emb, dna_mask, prot_mask)  # (B*group_size,)
+        with autocast(device_type=device.type, dtype=amp_dtype):
+            scores = model(dna_emb, prot_emb)
             loss   = loss_fn(scores)
 
         scaler.scale(loss).backward()
@@ -118,21 +113,20 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device, group_siz
 @torch.no_grad()
 def evaluate(model, loader, loss_fn, device, group_size):
     model.eval()
+    amp_dtype  = get_autocast_dtype(device)
     total_loss = 0.0
     all_scores, all_labels = [], []
 
     for batch in loader:
-        dna_emb   = batch["dna_emb"].to(device)
-        prot_emb  = batch["prot_emb"].to(device)
-        dna_mask  = batch["dna_pad_mask"].to(device)
-        prot_mask = batch["prot_pad_mask"].to(device)
-        labels    = batch["labels"]
+        dna_emb  = batch["dna_emb"].to(device)
+        prot_emb = batch["prot_emb"].to(device)
+        labels   = batch["labels"]
 
-        with autocast(device_type=device.type, dtype=torch.bfloat16):
-            scores = model(dna_emb, prot_emb, dna_mask, prot_mask)
+        with autocast(device_type=device.type, dtype=amp_dtype):
+            scores = model(dna_emb, prot_emb)
             loss   = loss_fn(scores)
 
-        total_loss  += loss.item()
+        total_loss += loss.item()
         all_scores.append(scores.cpu().float().numpy())
         all_labels.append(labels.numpy())
 
@@ -143,9 +137,13 @@ def evaluate(model, loader, loss_fn, device, group_size):
     return metrics
 
 
-# ---------------------------------------------------------------------------
-# LR schedule helpers
-# ---------------------------------------------------------------------------
+def get_autocast_dtype(device: torch.device):
+    if device.type == "cuda":
+        return torch.bfloat16
+    return torch.float16
+
+
+
 
 def get_cosine_schedule_with_warmup(optimizer, warmup_steps: int, total_steps: int):
     def lr_lambda(step):
@@ -186,29 +184,26 @@ def load_checkpoint(path: str, model, optimizer=None, scheduler=None):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train BindingTransformer")
-    p.add_argument("--data_dir",   required=True)
-    p.add_argument("--train_csv",  required=True)
-    p.add_argument("--val_csv",    required=True)
-    p.add_argument("--output_dir", default="checkpoints")
-    p.add_argument("--epochs",     type=int,   default=100)
-    p.add_argument("--batch_size", type=int,   default=4,    help="data points per batch")
-    p.add_argument("--n_negatives",type=int,   default=7)
-    p.add_argument("--lr",         type=float, default=1e-4)
-    p.add_argument("--weight_decay",type=float,default=0.01)
-    p.add_argument("--tau",        type=float, default=0.07)
+    p.add_argument("--data_dir",    required=True,  help="directory containing .npy files")
+    p.add_argument("--train_list",  required=True,  help="text file listing training .npy filenames")
+    p.add_argument("--val_list",    required=True,  help="text file listing validation .npy filenames")
+    p.add_argument("--output_dir",  default="checkpoints")
+    p.add_argument("--epochs",      type=int,   default=100)
+    p.add_argument("--batch_size",  type=int,   default=10,  help="data points per batch")
+    p.add_argument("--lr",          type=float, default=1e-4)
+    p.add_argument("--weight_decay",type=float, default=0.01)
+    p.add_argument("--tau",         type=float, default=0.07)
     p.add_argument("--learnable_tau", action="store_true")
-    p.add_argument("--warmup_frac",type=float, default=0.05)
-    p.add_argument("--patience",   type=int,   default=10,   help="early stopping patience")
-    p.add_argument("--max_dna_len", type=int,  default=60)
-    p.add_argument("--max_prot_len",type=int,  default=512)
-    p.add_argument("--num_workers", type=int,  default=4)
-    p.add_argument("--resume",     default=None, help="path to checkpoint to resume from")
+    p.add_argument("--warmup_frac", type=float, default=0.05)
+    p.add_argument("--patience",    type=int,   default=10,  help="early stopping patience")
+    p.add_argument("--num_workers", type=int,   default=4)
+    p.add_argument("--resume",      default=None, help="checkpoint path to resume from")
     # Model config overrides
-    p.add_argument("--d_model",    type=int,   default=768)
-    p.add_argument("--n_heads",    type=int,   default=12)
-    p.add_argument("--n_layers",   type=int,   default=6)
-    p.add_argument("--d_ffn",      type=int,   default=3072)
-    p.add_argument("--dropout",    type=float, default=0.1)
+    p.add_argument("--d_model",  type=int,   default=768)
+    p.add_argument("--n_heads",  type=int,   default=12)
+    p.add_argument("--n_layers", type=int,   default=6)
+    p.add_argument("--d_ffn",    type=int,   default=3072)
+    p.add_argument("--dropout",  type=float, default=0.1)
     return p.parse_args()
 
 
@@ -216,33 +211,35 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"Device: {device}")
 
     # --- Data ---
-    group_size = 1 + args.n_negatives  # 8
+    group_size = 8  # 1 positive + 7 negatives, fixed by data format
     train_loader, val_loader = build_dataloaders(
         data_dir=args.data_dir,
-        train_csv=args.train_csv,
-        val_csv=args.val_csv,
+        train_list=args.train_list,
+        val_list=args.val_list,
         batch_size=args.batch_size,
-        n_negatives=args.n_negatives,
-        max_dna_len=args.max_dna_len,
-        max_prot_len=args.max_prot_len,
         num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
     )
 
     # --- Model ---
-    max_seq_len = 1 + args.max_dna_len + 1 + args.max_prot_len + 1
     model_config = {
         "d_model":     args.d_model,
-        "d_dna":       768,
-        "d_prot":      320,
+        "d_dna":       512,
+        "d_prot":      960,
         "n_heads":     args.n_heads,
         "n_layers":    args.n_layers,
         "d_ffn":       args.d_ffn,
         "dropout":     args.dropout,
-        "max_seq_len": max_seq_len,
+        "max_seq_len": 577,   # CLS(1) + DNA(60) + SEP(1) + Prot(514) + END(1)
     }
     model = build_model(model_config).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -255,7 +252,7 @@ def main():
         learnable=args.learnable_tau,
     ).to(device)
 
-    # --- Optimizer (include loss_fn params if tau is learnable) ---
+    # --- Optimizer ---
     optimizer = torch.optim.AdamW(
         list(model.parameters()) + list(loss_fn.parameters()),
         lr=args.lr,
@@ -263,13 +260,11 @@ def main():
     )
 
     # --- LR schedule ---
-    total_steps   = args.epochs * len(train_loader)
-    warmup_steps  = max(500, int(args.warmup_frac * total_steps))
-    scheduler     = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    total_steps  = args.epochs * len(train_loader)
+    warmup_steps = max(500, int(args.warmup_frac * total_steps))
+    scheduler    = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
-    # --- Mixed precision scaler (bfloat16 doesn't need scaler, but keep for fp16 compat) ---
     scaler = GradScaler(enabled=(device.type == "cuda"))
-
     # --- Resume ---
     start_epoch = 0
     if args.resume:
@@ -292,20 +287,18 @@ def main():
         val_top1    = val_metrics["top1_acc"]
         val_loss    = val_metrics["loss"]
 
-        tau_val = loss_fn.tau.item()
         print(
             f"Epoch {epoch:03d} | "
             f"train_loss={train_loss:.4f} | "
             f"val_loss={val_loss:.4f} | "
             f"auroc={val_auroc:.4f} | "
             f"top1={val_top1:.4f} | "
-            f"tau={tau_val:.4f} | "
+            f"tau={loss_fn.tau.item():.4f} | "
             f"lr={scheduler.get_last_lr()[0]:.2e}"
         )
 
-        # Save best
         if val_auroc > best_auroc:
-            best_auroc = val_auroc
+            best_auroc    = val_auroc
             patience_left = args.patience
             save_checkpoint(
                 os.path.join(args.output_dir, "best.pt"),
@@ -317,7 +310,6 @@ def main():
                 print(f"Early stopping at epoch {epoch} (best AUROC={best_auroc:.4f})")
                 break
 
-        # Save latest every 5 epochs
         if epoch % 5 == 0:
             save_checkpoint(
                 os.path.join(args.output_dir, f"epoch_{epoch:03d}.pt"),
