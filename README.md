@@ -27,44 +27,45 @@ pip install -r requirements-gpu.txt
 
 ### 2.1 Sample file format
 
-Each sample file is a `.npy` file containing a Python dict with two keys:
+Each `.npy` file stores **exactly one batch** (10 data points) as a Python dict:
 
 | Key | Shape | Description |
 |-----|-------|-------------|
-| `dna` | `(N, 8, 60, 512)` | DNA embeddings from DNABERT-2 |
-| `prot` | `(N, 8, 514, 960)` | Protein embeddings from ESM-2 |
+| `dna` | `(10, 8, 60, 512)` | DNA embeddings from DNABERT-2 |
+| `prot` | `(10, 8, 514, 960)` | Protein embeddings from ESM-2 |
 
-- `N` — number of data points in the file
+- `10` — data points per file, fixed to match batch size
 - `8` — samples per data point: **index 0 is the positive**, indices 1–7 are negatives
-- Embeddings must be pre-extracted offline (see `src/extract_embeddings.py`)
 
-Save files to the `data/` directory:
+**Why one batch per file?** Each file is loaded in full by one DataLoader worker (~160 MB). With `num_workers=4`, peak RAM usage is 4 × 160 MB = 640 MB, regardless of total dataset size. This avoids OOM when training on large datasets.
 
-```
-data/
-    samples_001.npy
-    samples_002.npy
-    samples_003.npy
-    ...
-```
-
-To convert raw DNA/protein `.npy` arrays into the combined format:
+To save in the correct format:
 
 ```python
 import numpy as np
 
-dna  = np.load("100.dna.embeddings.npy")   # (N, 8, 60, 512)
-prot = np.load("100.protein.embeddings.npy")  # (N, 8, 514, 960)
-np.save("data/samples_001.npy", {"dna": dna, "prot": prot})
+# dna_array:  (10, 8, 60,  512) float32
+# prot_array: (10, 8, 514, 960) float32
+np.save("data/samples_001.npy", {"dna": dna_array, "prot": prot_array})
+```
+
+Place all files in the `data/` directory:
+
+```
+data/
+    samples_001.npy    # 10 data points
+    samples_002.npy    # 10 data points
+    samples_003.npy
+    ...
 ```
 
 ### 2.2 Train / val split
 
 Split is done at the **file level** to prevent data leakage between batches from the same experimental source.
 
-Create two plain text files listing which sample files go to train and which to val (one filename per line):
+Create two plain text files listing which `.npy` files go to train and val (one filename per line):
 
-```bash
+```
 # data/train_files.txt
 samples_001.npy
 samples_002.npy
@@ -96,12 +97,11 @@ Key arguments:
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--epochs` | 100 | Total training epochs |
-| `--batch_size` | 10 | Data points per batch (80 sequences) |
 | `--lr` | 1e-4 | Learning rate |
 | `--patience` | 10 | Early stopping patience (epochs) |
 | `--tau` | 0.07 | InfoNCE temperature |
 | `--learnable_tau` | off | Make temperature a learnable parameter |
-| `--num_workers` | 4 | DataLoader worker processes |
+| `--num_workers` | 4 | DataLoader worker processes (peak RAM = num_workers × 160 MB) |
 | `--resume` | — | Path to checkpoint to resume from |
 
 ### 3.2 Resume from checkpoint

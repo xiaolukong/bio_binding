@@ -189,7 +189,6 @@ def parse_args():
     p.add_argument("--val_list",    required=True,  help="text file listing validation .npy filenames")
     p.add_argument("--output_dir",  default="checkpoints")
     p.add_argument("--epochs",      type=int,   default=100)
-    p.add_argument("--batch_size",  type=int,   default=10,  help="data points per batch")
     p.add_argument("--lr",          type=float, default=1e-4)
     p.add_argument("--weight_decay",type=float, default=0.01)
     p.add_argument("--tau",         type=float, default=0.07)
@@ -225,7 +224,6 @@ def main():
         data_dir=args.data_dir,
         train_list=args.train_list,
         val_list=args.val_list,
-        batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
     )

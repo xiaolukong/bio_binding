@@ -3,16 +3,19 @@ Dataset utilities for DNA-Protein binding affinity training.
 
 Data format
 -----------
-Each .npy file stores a dict with two keys:
-    'dna':  float32 array of shape (N, 8, 60,  512)
-    'prot': float32 array of shape (N, 8, 514, 960)
+Each .npy file stores one batch as a Python dict with two keys:
+    'dna':  float32 array of shape (10, 8, 60,  512)
+    'prot': float32 array of shape (10, 8, 514, 960)
 
-    N   = number of data points in this file
+    10  = data points per file (= batch size)
     8   = samples per data point (index 0 = positive, 1-7 = negatives)
     60  = DNA token length
-    512 = DNA embedding dim (DNABERT-2 output)
+    512 = DNA embedding dim  (DNABERT-2)
     514 = Protein token length
-    960 = Protein embedding dim (ESM-2 output)
+    960 = Protein embedding dim (ESM-2)
+
+One file = one batch. __getitem__ loads one file (~160 MB) and returns all
+10 data points. RAM peak = num_workers × 160 MB, regardless of dataset size.
 
 File layout
 -----------
@@ -20,11 +23,8 @@ File layout
         samples_001.npy
         samples_002.npy
         ...
-        train_files.txt   # one filename per line, e.g. "samples_001.npy"
+        train_files.txt   # one filename per line
         val_files.txt
-
-Train/val split is done at the file level to prevent data leakage between
-data points that may share the same protein or experimental batch.
 """
 
 import os
@@ -33,74 +33,48 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 
+_LABELS = torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])  # index 0 = positive
+
+
 class BindingDataset(Dataset):
     """
-    Loads one or more .npy sample files and exposes individual data points.
-
-    Each __getitem__ returns a dict with tensors of shape:
-        dna_emb:  (8, 60,  512)  -- all 8 samples for this data point
-        prot_emb: (8, 514, 960)
-        labels:   (8,)           -- 1 for positive (index 0), 0 for negatives
+    One file = one batch. __getitem__ loads a single file (~160 MB) and
+    returns all data points in it as flat tensors ready for the model.
+    RAM usage = num_workers x file size at any point during training.
     """
 
     def __init__(self, file_paths: list[str]):
-        """
-        Args:
-            file_paths: list of absolute paths to .npy sample files.
-        """
-        dna_chunks  = []
-        prot_chunks = []
-
-        for path in file_paths:
-            data = np.load(path, allow_pickle=True).item()
-            dna_chunks.append(data["dna"])    # (N, 8, 60,  512)
-            prot_chunks.append(data["prot"])  # (N, 8, 514, 960)
-
-        dna_all  = np.concatenate(dna_chunks,  axis=0)  # (total_N, 8, 60,  512)
-        prot_all = np.concatenate(prot_chunks, axis=0)  # (total_N, 8, 514, 960)
-
-        # Store as float32 tensors; labels are fixed: index 0 = positive
-        self.dna  = torch.from_numpy(dna_all)   # (total_N, 8, 60,  512)
-        self.prot = torch.from_numpy(prot_all)  # (total_N, 8, 514, 960)
-
-        n_samples  = self.dna.size(1)
-        self.labels = torch.zeros(n_samples, dtype=torch.float32)
-        self.labels[0] = 1.0  # index 0 is always the positive
+        self._files = file_paths
 
     def __len__(self) -> int:
-        return self.dna.size(0)
+        return len(self._files)
 
     def __getitem__(self, idx: int) -> dict:
+        data     = np.load(self._files[idx], allow_pickle=True).item()
+        dna_emb  = torch.from_numpy(data["dna"].copy())   # (10, 8, 60,  512)
+        prot_emb = torch.from_numpy(data["prot"].copy())  # (10, 8, 514, 960)
+        B        = dna_emb.size(0)   # data points in this file
+        group    = dna_emb.size(1)   # 8
+
+        labels = _LABELS.unsqueeze(0).expand(B, -1)  # (10, 8)
+
         return {
-            "dna_emb":  self.dna[idx],    # (8, 60,  512)
-            "prot_emb": self.prot[idx],   # (8, 514, 960)
-            "labels":   self.labels,      # (8,)  shared across all data points
+            "dna_emb":  dna_emb.view(B * group, *dna_emb.shape[2:]),    # (80, 60,  512)
+            "prot_emb": prot_emb.view(B * group, *prot_emb.shape[2:]),  # (80, 514, 960)
+            "labels":   labels.reshape(B * group),                       # (80,)
         }
 
 
 def collate_fn(batch: list[dict]) -> dict[str, torch.Tensor]:
     """
-    Collates a list of data point dicts into flat batch tensors.
-
-    Input:  list of B dicts, each with tensors (8, L, D)
-    Output: flat tensors of shape (B*8, L, D) ready for the model
+    Each item in batch is already a full batch from one file.
+    With DataLoader batch_size=1, this simply unwraps the single item.
     """
-    B          = len(batch)
-    group_size = batch[0]["dna_emb"].size(0)   # 8
-
-    dna_emb  = torch.stack([s["dna_emb"]  for s in batch], dim=0)  # (B, 8, 60,  512)
-    prot_emb = torch.stack([s["prot_emb"] for s in batch], dim=0)  # (B, 8, 514, 960)
-    labels   = torch.stack([s["labels"]   for s in batch], dim=0)  # (B, 8)
-
-    return {
-        "dna_emb":  dna_emb.view(B * group_size, *dna_emb.shape[2:]),    # (B*8, 60,  512)
-        "prot_emb": prot_emb.view(B * group_size, *prot_emb.shape[2:]),  # (B*8, 514, 960)
-        "labels":   labels.view(B * group_size),                          # (B*8,)
-    }
+    assert len(batch) == 1, "DataLoader batch_size must be 1 (one file = one batch)"
+    return batch[0]
 
 
 def _resolve_file_list(data_dir: str, list_file: str) -> list[str]:
-    """Reads a text file of filenames and returns absolute paths."""
     with open(list_file) as f:
         names = [line.strip() for line in f if line.strip()]
     return [os.path.join(data_dir, name) for name in names]
@@ -110,17 +84,16 @@ def build_dataloaders(
     data_dir: str,
     train_list: str,
     val_list: str,
-    batch_size: int = 10,
     num_workers: int = 4,
     pin_memory: bool = True,
 ) -> tuple[DataLoader, DataLoader]:
     """
     Args:
-        data_dir:   directory containing .npy files
-        train_list: path to text file listing training .npy filenames
-        val_list:   path to text file listing validation .npy filenames
-        batch_size: number of data points per batch
-        num_workers: DataLoader worker count
+        data_dir:    directory containing .npy files (10 data points each)
+        train_list:  text file listing training .npy filenames
+        val_list:    text file listing validation .npy filenames
+        num_workers: DataLoader worker processes; RAM peak = num_workers x 160 MB
+        pin_memory:  True for CUDA, False for MPS/CPU
     """
     train_files = _resolve_file_list(data_dir, train_list)
     val_files   = _resolve_file_list(data_dir, val_list)
@@ -129,7 +102,7 @@ def build_dataloaders(
     val_ds   = BindingDataset(val_files)
 
     loader_kwargs = dict(
-        batch_size=batch_size,
+        batch_size=1,          # one file = one batch, batch composition done in __getitem__
         collate_fn=collate_fn,
         num_workers=num_workers,
         pin_memory=pin_memory,
