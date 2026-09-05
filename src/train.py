@@ -237,7 +237,7 @@ def main():
         "n_layers":    args.n_layers,
         "d_ffn":       args.d_ffn,
         "dropout":     args.dropout,
-        "max_seq_len": 577,   # CLS(1) + DNA(60) + SEP(1) + Prot(514) + END(1)
+        "max_seq_len": 576,   # DNA(60) + SEP(1) + Prot(514) + END(1)
     }
     model = build_model(model_config).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

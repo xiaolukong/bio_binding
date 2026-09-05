@@ -51,6 +51,40 @@ class FlashAttention(nn.Module):
         return self.out_proj(out)
 
 
+class AttentionPooling(nn.Module):
+    """
+    Attention pooling over the final layer.
+
+    A single learnable query attends over all (non-padded) tokens and produces
+    a weighted sum. Unlike a CLS token, the pooling happens once on the final
+    representation with a short gradient path to every token, which learns more
+    easily on smaller datasets while still focusing on sparse binding sites.
+    """
+
+    def __init__(self, d_model: int, dropout: float = 0.0):
+        super().__init__()
+        self.query  = nn.Parameter(torch.empty(1, 1, d_model))
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.drop   = nn.Dropout(dropout)
+        self.scale  = d_model ** -0.5
+
+    def forward(self, x: torch.Tensor, pad_mask: torch.Tensor | None = None) -> torch.Tensor:
+        # x: (B, L, d_model)   pad_mask: (B, L)  True = padding (ignore)
+        B = x.size(0)
+        q = self.query.expand(B, -1, -1)                  # (B, 1, d_model)
+        k = self.k_proj(x)                                # (B, L, d_model)
+        v = self.v_proj(x)                                # (B, L, d_model)
+
+        scores = (q @ k.transpose(-2, -1)) * self.scale   # (B, 1, L)
+        if pad_mask is not None:
+            scores = scores.masked_fill(pad_mask.unsqueeze(1), float("-inf"))
+
+        weights = self.drop(scores.softmax(dim=-1))       # (B, 1, L)
+        pooled  = weights @ v                             # (B, 1, d_model)
+        return pooled.squeeze(1)                          # (B, d_model)
+
+
 class TransformerEncoderLayer(nn.Module):
     """Pre-LN Transformer encoder layer with Flash Attention."""
 
@@ -99,14 +133,13 @@ class BindingTransformer(nn.Module):
         n_layers = config["n_layers"]      # 6
         d_ffn    = config["d_ffn"]         # 3072
         dropout  = config["dropout"]       # 0.1
-        max_len  = config["max_seq_len"]   # 575
+        max_len  = config["max_seq_len"]   # 576
 
         # --- Modality projections ---
         self.dna_proj  = nn.Linear(d_dna,  d_model)
         self.prot_proj = nn.Linear(d_prot, d_model)
 
         # --- Special token embeddings ---
-        self.cls_token = nn.Parameter(torch.empty(1, 1, d_model))
         self.sep_token = nn.Parameter(torch.empty(1, 1, d_model))
         self.end_token = nn.Parameter(torch.empty(1, 1, d_model))
 
@@ -122,7 +155,10 @@ class BindingTransformer(nn.Module):
             for _ in range(n_layers)
         ])
 
-        # --- CLS projection head ---
+        # --- Attention pooling over final layer ---
+        self.attn_pool = AttentionPooling(d_model, dropout)
+
+        # --- Projection head ---
         self.head = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model),
@@ -134,9 +170,9 @@ class BindingTransformer(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
         nn.init.trunc_normal_(self.sep_token, std=0.02)
         nn.init.trunc_normal_(self.end_token, std=0.02)
+        nn.init.trunc_normal_(self.attn_pool.query, std=0.02)
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.trunc_normal_(module.weight, std=0.02)
@@ -166,18 +202,17 @@ class BindingTransformer(nn.Module):
         L_prot = prot_x.size(1)
 
         # Expand special tokens to batch
-        cls = self.cls_token.expand(B, -1, -1)   # (B, 1, d_model)
         sep = self.sep_token.expand(B, -1, -1)
         end = self.end_token.expand(B, -1, -1)
 
-        # Concatenate: [CLS] | DNA | [SEP] | Prot | [END]
-        x       = torch.cat([cls, dna_x, sep, prot_x, end], dim=1)
+        # Concatenate: DNA | [SEP] | Prot | [END]
+        x       = torch.cat([dna_x, sep, prot_x, end], dim=1)
         L_total = x.size(1)
 
-        # --- Segment embeddings (A=0: CLS+DNA+SEP, B=1: Prot+END) ---
+        # --- Segment embeddings (A=0: DNA+SEP, B=1: Prot+END) ---
         seg_ids = torch.cat([
-            torch.zeros(1 + L_dna + 1, dtype=torch.long, device=device),
-            torch.ones( L_prot + 1,    dtype=torch.long, device=device),
+            torch.zeros(L_dna + 1, dtype=torch.long, device=device),
+            torch.ones( L_prot + 1, dtype=torch.long, device=device),
         ]).unsqueeze(0).expand(B, -1)
         x = x + self.segment_emb(seg_ids)
 
@@ -191,15 +226,15 @@ class BindingTransformer(nn.Module):
             dna_pad_mask = torch.zeros(B, L_dna, dtype=torch.bool, device=device)
         if prot_pad_mask is None:
             prot_pad_mask = torch.zeros(B, L_prot, dtype=torch.bool, device=device)
-        pad_mask = torch.cat([no_mask, dna_pad_mask, no_mask, prot_pad_mask, no_mask], dim=1)
+        pad_mask = torch.cat([dna_pad_mask, no_mask, prot_pad_mask, no_mask], dim=1)
 
         # --- Transformer layers ---
         for layer in self.layers:
             x = layer(x, key_padding_mask=pad_mask)
 
-        # --- CLS head ---
-        h_cls = x[:, 0, :]
-        return self.head(h_cls).squeeze(-1)   # (B,)
+        # --- Attention pooling head ---
+        pooled = self.attn_pool(x, pad_mask=pad_mask)
+        return self.head(pooled).squeeze(-1)   # (B,)
 
 
 def build_model(config: dict | None = None) -> BindingTransformer:
@@ -211,7 +246,7 @@ def build_model(config: dict | None = None) -> BindingTransformer:
         "n_layers":    6,
         "d_ffn":       3072,
         "dropout":     0.1,
-        "max_seq_len": 577,   # CLS(1) + DNA(60) + SEP(1) + Prot(514) + END(1)
+        "max_seq_len": 576,   # DNA(60) + SEP(1) + Prot(514) + END(1)
     }
     if config is not None:
         default_config.update(config)
